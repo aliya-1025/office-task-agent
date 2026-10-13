@@ -1,8 +1,14 @@
 name: Daily Points Agent
 on:
   schedule:
-    - cron: "0 18 * * *"
-  workflow_dispatch: {}
+    - cron: '*/30 4-17 * * *'
+    - cron: '32 17 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: points-agent
+  cancel-in-progress: false
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -21,3 +27,4 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           BOSS_EMAIL: ${{ secrets.BOSS_EMAIL }}
+          SEND_EMAIL: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '32 17 * * *' }}
