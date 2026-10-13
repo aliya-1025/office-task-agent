@@ -2,8 +2,9 @@
 """
 ALY MEDIA - Daily Points Agent
 Employees ki daily log sheet padhta hai -> points nikalta hai ->
-report workbook banata hai (Dashboard + Daily (saare din) + har employee ka alag tab +
-Weekly + Monthly). Boss ko optional email bhi bhejta hai.
+report workbook banata hai:
+  Dashboard | Daily (saare din) | har employee ka tab | Weekly | Monthly | Points Rules
+Boss ko optional email bhi bhejta hai.
 """
 import os, re, json, time, smtplib, datetime as dt
 from collections import defaultdict
@@ -42,10 +43,19 @@ def classify(status):
     if "approved" in s: return "approved"
     return "pending"
 
-DAY_RE = re.compile(r"\s*day\s*:?\s*(?:\d+\s+)?(\d{1,2})[/\-.](\d{1,2})", re.I)
+DAY_START = re.compile(r"^\W*day\b", re.I)
+DATE_RE = re.compile(r"(\d{1,2})[/\-.](\d{1,2})(?:[/\-.](\d{2,4}))?")
+SOLO_RE = re.compile(r"^\W*[A-Za-z]{0,12}\W*\d{1,2}[/\-.]\d{1,2}(?:[/\-.]\d{2,4})?\W*$")
 
-def make_date(a, b, today):
+def make_date(a, b, today, year=None):
     d, m = (b, a) if DATE_ORDER == "mdy" else (a, b)
+    if year:
+        y = int(year)
+        y = y + 2000 if y < 100 else y
+        try:
+            return dt.date(y, m, d)
+        except ValueError:
+            return None
     try:
         x = dt.date(today.year, m, d)
     except ValueError:
@@ -54,17 +64,29 @@ def make_date(a, b, today):
         x = x.replace(year=today.year - 1)
     return x
 
+def header_date(row, line, today):
+    """Din ka header pehchanta hai: 'Day:1 12/10', 'Day 2 - 13/10/2026', 'Tuesday 13/10', '13/10'.
+    Returns (is_header, date)."""
+    cells = [c for c in row if c.strip()]
+    is_hdr = bool(DAY_START.match(line)) or (len(cells) == 1 and bool(SOLO_RE.match(line)))
+    if not is_hdr:
+        return False, None
+    m = DATE_RE.search(line)
+    if not m:
+        return False, None
+    return True, make_date(int(m.group(1)), int(m.group(2)), today, m.group(3))
+
 def parse_rows(rows, today):
-    """Log tab ki rows -> entries. 'Day:1 12/10' wale blocks padhta hai."""
+    """Log tab ki rows -> entries. Din ke blocks ('Day:1 12/10') padhta hai."""
     cols = {"category": 1, "task": 2, "status": 3, "number": 4}
     cur, out = None, []
     for r in rows:
         line = " ".join(c for c in r if c).strip()
         if not line:
             continue
-        m = DAY_RE.match(line)
-        if m:
-            cur = make_date(int(m.group(1)), int(m.group(2)), today)
+        is_hdr, d = header_date(r, line, today)
+        if is_hdr:
+            cur = d
             continue
         low = [c.strip().lower() for c in r]
         if "category" in low:
@@ -158,7 +180,7 @@ def pct(avg): return f"{avg / DAILY_TARGET * 100:.0f}%"
 def r1(x): return round(x, 1)
 
 def work_summary(rs):
-    """Ek din ka kaam: 'Thumbnail x37, Promo x2' (sirf counted pieces)."""
+    """Kaam ki list: 'Thumbnail x37, Promo x2' (sirf counted pieces)."""
     c = defaultdict(float)
     for r in rs:
         if r["status"] in COUNTS_BASE:
@@ -167,21 +189,25 @@ def work_summary(rs):
 
 # ------------------------- REPORT LAYOUT -------------------------
 class Page:
-    def __init__(self, ncols): self.rows, self.hdr, self.sec, self.ncols = [], [], [], ncols
+    def __init__(self, ncols, widths=None, wrap=None):
+        self.rows, self.hdr, self.sec, self.tot = [], [], [], []
+        self.ncols, self.widths, self.wrap = ncols, widths or {}, wrap or []
     def add(self, row=None, kind=None):
         self.rows.append(row or [])
         n = len(self.rows)
         if kind == "hdr": self.hdr.append(n)
-        if kind == "sec": self.sec.append(n)
+        elif kind == "sec": self.sec.append(n)
+        elif kind == "tot": self.tot.append(n)
 
-def dashboard(emps, days, recs, rd):
-    p = Page(9)
+def dashboard(emps, days, recs, rd, last_log=None):
+    last_log = last_log or {}
+    p = Page(8, widths={1: 200, 2: 90, 3: 90, 4: 100, 5: 150, 6: 110, 7: 220, 8: 480}, wrap=[7, 8])
     p.add(["ALY MEDIA - PERFORMANCE DASHBOARD"])
     p.add([f"Report date: {rd:%d %b %Y}   |   Daily target: {DAILY_TARGET:g} pts   |   "
            f"Updated: {dt.datetime.now(TZ):%d %b %Y %H:%M}"])
     p.add()
     p.add([f"TODAY - {rd:%d %b %Y}"], "sec")
-    p.add(["Rank", "Employee", "Points", "Target %", "Approved", "Not approved / Pending", "On-hold pts", "Remarks", "Work done"], "hdr")
+    p.add(["Employee", "Points", "Target %", "Approved", "Not approved / Pending", "On-hold pts", "Remarks", "Work done"], "hdr")
     tw = defaultdict(list)
     for r in recs:
         if r["date"] == rd: tw[r["emp"]].append(r)
@@ -189,24 +215,28 @@ def dashboard(emps, days, recs, rd):
                    key=lambda x: -(x[1]["points"] if x[1] else -1e9))
     for i, (e, v) in enumerate(today, 1):
         if not v:
-            p.add([i, e, 0, "0%", 0, 0, 0, "No log submitted", "-"]); continue
+            ll = last_log.get(e)
+            rem = f"No log for today (last log: {ll:%d %b})" if ll else "No log submitted"
+            p.add([f"{i}. {e}", 0, "0%", 0, 0, 0, rem, "-"]); continue
         flag = "Check entries (unusually high)" if v["points"] > 2 * DAILY_TARGET else ""
-        p.add([i, e, r1(v["points"]), pct(v["points"]), v["ok"], v["notok"], r1(v["held"]), flag, work_summary(tw[e])])
+        p.add([f"{i}. {e}", r1(v["points"]), pct(v["points"]), v["ok"], v["notok"], r1(v["held"]), flag, work_summary(tw[e])])
     ws = rd - dt.timedelta(days=rd.weekday())
     for title, a in ((f"THIS WEEK (from {ws:%d %b})", ws), (f"THIS MONTH - {rd:%B %Y}", rd.replace(day=1))):
         p.add(); p.add([title], "sec")
-        p.add(["Rank", "Employee", "Points", "Days logged", "Avg / day", "Target %"], "hdr")
+        p.add(["Employee", "Points", "Target %", "Days logged", "Avg / day", "On-hold pts", "Total pieces", "Work done"], "hdr")
         rows = []
         for e in emps:
+            rs = [r for r in recs if r["emp"] == e and a <= r["date"] <= rd]
             pts, n = period(days, e, a, rd)
-            rows.append((e, pts, n, pts / n if n else 0))
-        for i, (e, pts, n, avg) in enumerate(sorted(rows, key=lambda x: -x[1]), 1):
-            p.add([i, e, r1(pts), n, r1(avg), pct(avg)])
+            pcs = sum(r["number"] for r in rs if r["status"] in COUNTS_BASE)
+            rows.append((e, pts, n, pts / n if n else 0, sum(r["held"] for r in rs), pcs, work_summary(rs)))
+        for i, (e, pts, n, avg, held, pcs, wsum) in enumerate(sorted(rows, key=lambda x: -x[1]), 1):
+            p.add([f"{i}. {e}", r1(pts), pct(avg), n, r1(avg), r1(held), r1(pcs), wsum])
     return p
 
 def daily_history(emps, days, recs):
     """Saare din ek tab me. Purane din kabhi nahi mitte, naye din NEECHE judte hain."""
-    p = Page(7)
+    p = Page(7, widths={1: 200, 2: 90, 3: 90, 4: 480, 5: 100, 6: 150, 7: 100}, wrap=[4])
     p.add(["DAILY REPORT - ALL DAYS (naye din neeche)"])
     p.add()
     by = defaultdict(lambda: defaultdict(list))
@@ -245,45 +275,72 @@ def employee_page(emp, days, recs, rd):
                r["ppp"], r1(r["base"]), f"{r['adj']:+d}", r1(r["total"]), r["note"]])
     return p
 
-def weekly_monthly(emps, days, recs):
-    """Weekly/Monthly: har employee ke liye category-wise total kaam + points. Naye period neeche."""
-    cats = sorted({r["category_rule"] for r in recs})
-    wh = ["Week starting (Mon)", "Employee"] + cats + ["Not counted pcs", "Points", "Days logged", "Avg / day", "Target %"]
-    mh = ["Month", "Employee"] + cats + ["Not counted pcs", "Points", "Days logged", "Avg / day", "Target %", "Approval rate", "Rank"]
-    wk, mo = Page(len(wh)), Page(len(mh))
-    wk.add(["WEEKLY REPORT - total kaam + points (naye hafte neeche)"], "sec"); wk.add(wh, "hdr")
-    mo.add(["MONTHLY REPORT - total kaam + points (naye mahine neeche)"], "sec"); mo.add(mh, "hdr")
-
-    W = defaultdict(lambda: dict(pts=0.0, n=0, cnt=defaultdict(float), nc=0.0))
-    M = defaultdict(lambda: dict(pts=0.0, n=0, ok=0, tot=0, cnt=defaultdict(float), nc=0.0))
-    for (e, d), v in days.items():
-        w = W[(d - dt.timedelta(days=d.weekday()), e)]; w["pts"] += v["points"]; w["n"] += 1
-        m = M[(d.replace(day=1), e)]
-        m["pts"] += v["points"]; m["n"] += 1; m["ok"] += v["ok"]; m["tot"] += v["n"]
+def period_report(emps, days, recs, key_fn, label_fn, title):
+    """Har hafte/mahine ke liye: pehle ranking table, phir har employee ka category-wise kaam."""
+    p = Page(6, widths={1: 260, 2: 110, 3: 120, 4: 130, 5: 110, 6: 110})
+    p.add([title])
+    p.add()
+    groups = defaultdict(lambda: defaultdict(list))
     for r in recs:
-        d, e = r["date"], r["emp"]
-        for x in (W[(d - dt.timedelta(days=d.weekday()), e)], M[(d.replace(day=1), e)]):
-            if r["status"] in COUNTS_BASE: x["cnt"][r["category_rule"]] += r["number"]
-            else: x["nc"] += r["number"]
+        groups[key_fn(r["date"])][r["emp"]].append(r)
+    for key in sorted(groups):
+        g = groups[key]
+        st = {}
+        for e in emps:
+            rs = g.get(e, [])
+            n = len({r["date"] for r in rs})
+            pts = sum(r["total"] for r in rs)
+            pcs = sum(r["number"] for r in rs if r["status"] in COUNTS_BASE)
+            st[e] = (pts, n, pts / n if n else 0, pcs, rs)
+        ranked = sorted(emps, key=lambda e: -st[e][0])
+        p.add([label_fn(key)], "sec")
+        p.add(["Employee", "Points", "Days logged", "Avg / day", "Target %", "Total pieces"], "hdr")
+        for i, e in enumerate(ranked, 1):
+            pts, n, avg, pcs, _ = st[e]
+            p.add([f"{i}. {e}", r1(pts), n, r1(avg), pct(avg), r1(pcs)])
+        p.add()
+        for e in ranked:
+            pts, n, avg, pcs, rs = st[e]
+            if not rs:
+                continue
+            p.add([f"{e.upper()} - kaam ki detail"], "sec")
+            p.add(["Category", "Pieces done", "Points earned", "Not counted pcs", "On-hold pts", "Entries"], "hdr")
+            cat = defaultdict(lambda: [0.0, 0.0, 0.0, 0.0, 0])   # done, points, not counted, held, entries
+            for r in rs:
+                c = cat[r["category_rule"]]
+                if r["status"] in COUNTS_BASE: c[0] += r["number"]
+                else: c[2] += r["number"]
+                c[1] += r["total"]; c[3] += r["held"]; c[4] += 1
+            for name, c in sorted(cat.items(), key=lambda kv: -kv[1][1]):
+                p.add([name, r1(c[0]), r1(c[1]), r1(c[2]), r1(c[3]), c[4]])
+            tot = [sum(c[i] for c in cat.values()) for i in range(5)]
+            p.add(["TOTAL", r1(tot[0]), r1(tot[1]), r1(tot[2]), r1(tot[3]), int(tot[4])], "tot")
+            p.add()
+        p.add()
+    return p
 
-    def counts(x): return [x["cnt"].get(c, 0) for c in cats]
-
-    for (w, e), x in sorted(W.items(), key=lambda kv: (kv[0][0], -kv[1]["pts"])):
-        avg = x["pts"] / x["n"]
-        wk.add([f"{w:%d %b %Y}", e] + counts(x) + [x["nc"], r1(x["pts"]), x["n"], r1(avg), pct(avg)])
-    for month in sorted({k[0] for k in M}):
-        ranked = sorted(((e, x) for (m, e), x in M.items() if m == month), key=lambda t: -t[1]["pts"])
-        for i, (e, x) in enumerate(ranked, 1):
-            avg = x["pts"] / x["n"]
-            mo.add([f"{month:%b %Y}", e] + counts(x) +
-                   [x["nc"], r1(x["pts"]), x["n"], r1(avg), pct(avg), f"{x['ok'] / x['tot'] * 100:.0f}%", i])
+def weekly_monthly(emps, days, recs):
+    wk = period_report(emps, days, recs,
+                       lambda d: d - dt.timedelta(days=d.weekday()),
+                       lambda w: f"WEEK: {w:%d %b} - {w + dt.timedelta(days=6):%d %b %Y}",
+                       "WEEKLY REPORT - kis ne kya kaam kiya (naye hafte neeche)")
+    mo = period_report(emps, days, recs,
+                       lambda d: d.replace(day=1),
+                       lambda m: f"MONTH: {m:%B %Y}",
+                       "MONTHLY REPORT - kis ne kya kaam kiya (naye mahine neeche)")
     return wk, mo
 
-def boss_text(emps, days, rd):
+def boss_text(emps, days, recs, rd):
     lines = [f"ALY MEDIA - Daily Report ({rd:%d %b %Y})", ""]
+    by = defaultdict(list)
+    for r in recs:
+        if r["date"] == rd: by[r["emp"]].append(r)
     for e in sorted(emps, key=lambda e: -(days.get((e, rd), {"points": 0})["points"])):
         v = days.get((e, rd))
-        lines.append(f"{e}: {r1(v['points'])} pts ({pct(v['points'])} of target)" if v else f"{e}: no log submitted")
+        if v:
+            lines.append(f"{e}: {r1(v['points'])} pts ({pct(v['points'])} of target) - {work_summary(by[e])}")
+        else:
+            lines.append(f"{e}: no log submitted")
     return "\n".join(lines)
 
 # ------------------------- GOOGLE SHEETS -------------------------
@@ -298,7 +355,9 @@ def client():
 NAVY = {"red": .12, "green": .23, "blue": .37}
 HDR = {"backgroundColor": NAVY, "horizontalAlignment": "CENTER",
        "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}}
-RESET = {"backgroundColor": {"red": 1, "green": 1, "blue": 1},
+TOT = {"backgroundColor": {"red": .90, "green": .93, "blue": .97}, "textFormat": {"bold": True}}
+RESET = {"backgroundColor": {"red": 1, "green": 1, "blue": 1}, "wrapStrategy": "OVERFLOW_CELL",
+         "verticalAlignment": "BOTTOM",
          "textFormat": {"bold": False, "fontSize": 10, "foregroundColor": {"red": 0, "green": 0, "blue": 0}}}
 
 def write_tab(sh, name, page):
@@ -312,12 +371,25 @@ def write_tab(sh, name, page):
     ws.resize(rows=max(len(page.rows) + 20, 60), cols=max(page.ncols, 8))
     ws.format("A1:AZ3000", RESET)
     ws.update(values=page.rows, range_name="A1")
-    fm = [{"range": "A1", "format": {"textFormat": {"bold": True, "fontSize": 16, "foregroundColor": NAVY}}}]
+    last = len(page.rows) + 1
+    fm = []
+    if page.wrap:
+        fm.append({"range": f"{a1(3, 1)}:{a1(last, page.ncols)}", "format": {"verticalAlignment": "TOP"}})
+        fm += [{"range": f"{a1(3, c)}:{a1(last, c)}", "format": {"wrapStrategy": "WRAP"}} for c in page.wrap]
+    fm.append({"range": "A1", "format": {"textFormat": {"bold": True, "fontSize": 16, "foregroundColor": NAVY}}})
     fm += [{"range": f"{a1(r, 1)}:{a1(r, page.ncols)}", "format": HDR} for r in page.hdr]
+    fm += [{"range": f"{a1(r, 1)}:{a1(r, page.ncols)}", "format": TOT} for r in page.tot]
     fm += [{"range": a1(r, 1), "format": {"textFormat": {"bold": True, "fontSize": 12, "foregroundColor": NAVY}}} for r in page.sec]
     ws.batch_format(fm)
-    try: ws.columns_auto_resize(0, page.ncols - 1)
-    except Exception: pass
+    if page.widths:
+        sh.batch_update({"requests": [
+            {"updateDimensionProperties": {
+                "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": c - 1, "endIndex": c},
+                "properties": {"pixelSize": w}, "fields": "pixelSize"}}
+            for c, w in page.widths.items()]})
+    else:
+        try: ws.columns_auto_resize(0, page.ncols - 1)
+        except Exception: pass
     time.sleep(3)  # API rate limit
     return ws
 
@@ -338,12 +410,19 @@ def main():
     log, sh = gc.open_by_key(os.environ["LOG_SHEET_ID"]), gc.open_by_key(os.environ["REPORT_SHEET_ID"])
     today = dt.datetime.now(TZ).date()
     rd = dt.date.fromisoformat(os.environ["REPORT_DATE"]) if os.getenv("REPORT_DATE") else today
+    print(f"Report date: {rd}  (today IST: {today})")
 
-    entries, emps = [], []
+    entries, emps, last_log = [], [], {}
     for ws in log.worksheets():
         if ws.title.lower() in IGNORE_TABS: continue
         emps.append(ws.title)
-        for e in parse_rows(ws.get_all_values(), today):
+        es = parse_rows(ws.get_all_values(), today)
+        dates = sorted({e["date"] for e in es})
+        print(f"[{ws.title}] {len(es)} entries; dates found: "
+              f"{', '.join(f'{d:%d %b}' for d in dates) or 'NONE'}")
+        ok = [d for d in dates if d <= rd]
+        if ok: last_log[ws.title] = max(ok)
+        for e in es:
             if e["date"] <= rd: entries.append({**e, "emp": ws.title})
 
     rules_ws, lookup = load_rules(sh)
@@ -355,7 +434,7 @@ def main():
     recs = score(entries, lookup, new_rule)
     days = day_stats(recs)
 
-    write_tab(sh, "Dashboard", dashboard(emps, days, recs, rd))
+    write_tab(sh, "Dashboard", dashboard(emps, days, recs, rd, last_log))
     write_tab(sh, "Daily", daily_history(emps, days, recs))
     for e in emps:
         write_tab(sh, e, employee_page(e, days, recs, rd))
@@ -369,9 +448,9 @@ def main():
         if not any(any(r) for r in d.get_all_values()): sh.del_worksheet(d)
     except Exception: pass
 
-    text = boss_text(emps, days, rd)
+    text = boss_text(emps, days, recs, rd)
     print(text)
-    # Email sirf tab jab SEND_EMAIL=true ho (raat ka run / manual run), har 30 min wale run par nahi
+    # Email sirf tab jab SEND_EMAIL=true ho (raat ka run / manual run)
     if (os.getenv("SEND_EMAIL", "").lower() == "true"
             and os.getenv("SMTP_USER") and os.getenv("BOSS_EMAIL")):
         msg = MIMEText(text + f"\n\nFull report: {sh.url}")
