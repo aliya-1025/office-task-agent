@@ -433,8 +433,9 @@ def employee_files(sh):
         ws = sh.worksheet("Employees")
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet("Employees", rows=60, cols=4)
-        ws.update(values=[["Employee", "Log File ID (ya poora link)", "Status (auto)"]], range_name="A1")
-        ws.format("A1:C1", HDR)
+        ws.update(values=[["Employee", "Log File ID (ya poora link)", "Status (auto)", "Email (optional)"]],
+                  range_name="A1")
+        ws.format("A1:D1", HDR)
         return ws, []
     out = []
     for i, r in enumerate(ws.get_all_values()[1:], start=2):
@@ -443,7 +444,8 @@ def employee_files(sh):
         if not name or not fid:
             continue
         m = re.search(r"/d/([A-Za-z0-9_-]+)", fid)
-        out.append((i, name, m.group(1) if m else fid))
+        email = r[3].strip() if len(r) > 3 else ""
+        out.append((i, name, m.group(1) if m else fid, email))
     return ws, out
 
 def category_names(lookup):
@@ -541,17 +543,205 @@ def ensure_today_block(f, ws, rows, today):
     f.batch_update({"requests": block_requests(ws.id, start)})
     return True
 
+# ------------------------- BOSS INSTRUCTIONS / SEEN TRACKING -------------------------
+BOSS_TAB = "Boss Instructions"
+STATUS_TAB = "Instruction Status"
+INSTR_TAB = "Instructions"
+
+def send_mail(to, subject, body):
+    if not (to and os.getenv("SMTP_USER") and os.getenv("SMTP_PASS")):
+        return False
+    try:
+        msg = MIMEText(body, _charset="utf-8")
+        msg["Subject"], msg["From"], msg["To"] = subject, os.environ["SMTP_USER"], to
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+            s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"]); s.send_message(msg)
+        return True
+    except Exception as ex:
+        print("Mail failed:", ex)
+        return False
+
+def _rng(sheet_id, r0, r1, c0, c1):
+    return {"sheetId": sheet_id, "startRowIndex": r0, "endRowIndex": r1,
+            "startColumnIndex": c0, "endColumnIndex": c1}
+
+def _col_widths(sheet_id, widths):
+    return [{"updateDimensionProperties": {
+        "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": c, "endIndex": c + 1},
+        "properties": {"pixelSize": w}, "fields": "pixelSize"}} for c, w in enumerate(widths)]
+
+def _hdr_req(sheet_id, ncols):
+    return {"repeatCell": {"range": _rng(sheet_id, 0, 1, 0, ncols), "cell": {"userEnteredFormat": {
+        "backgroundColor": NAVY, "horizontalAlignment": "CENTER",
+        "textFormat": {"bold": True, "foregroundColor": WHITE}}},
+        "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,textFormat)"}}
+
+def _wrap_req(sheet_id, col):
+    return {"repeatCell": {"range": _rng(sheet_id, 1, 300, col, col + 1), "cell": {"userEnteredFormat": {
+        "wrapStrategy": "WRAP", "verticalAlignment": "TOP"}},
+        "fields": "userEnteredFormat(wrapStrategy,verticalAlignment)"}}
+
+def ensure_boss_tab(sh, names):
+    """Report sheet me boss ka 'Boss Instructions' tab. Boss yahan likhta hai, agent sab ki file me pahuncha deta hai."""
+    import gspread
+    created = False
+    try:
+        ws = sh.worksheet(BOSS_TAB)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(BOSS_TAB, rows=300, cols=6); created = True
+        ws.update(values=[["ID (auto)", "Date", "To (khali = sab, ya naam)", "Instruction", "Deadline", "Priority"]],
+                  range_name="A1")
+    reqs = [
+        {"setDataValidation": {"range": _rng(ws.id, 1, 300, 2, 3), "rule": {
+            "condition": {"type": "ONE_OF_LIST", "values": [{"userEnteredValue": v} for v in ["All"] + names]},
+            "strict": False, "showCustomUi": True}}},
+        {"setDataValidation": {"range": _rng(ws.id, 1, 300, 5, 6), "rule": {
+            "condition": {"type": "ONE_OF_LIST", "values": [{"userEnteredValue": v} for v in ["High", "Normal"]]},
+            "strict": False, "showCustomUi": True}}},
+    ]
+    if created:
+        reqs += [_hdr_req(ws.id, 6), _wrap_req(ws.id, 3)] + _col_widths(ws.id, [80, 110, 170, 460, 120, 100])
+    sh.batch_update({"requests": reqs})
+    return ws
+
+def load_boss_instructions(ws, now):
+    """Boss ki rows padhta hai; ID aur Date khali ho to khud bhar deta hai."""
+    vals = ws.get_all_values()
+    nums = []
+    for r in vals[1:]:
+        m = re.match(r"I(\d+)$", r[0].strip()) if r else None
+        if m: nums.append(int(m.group(1)))
+    nxt = max(nums, default=0) + 1
+    out, updates = [], []
+    for rn, r in enumerate(vals[1:], start=2):
+        r = (r + [""] * 6)[:6]
+        text = r[3].strip()
+        if not text:
+            continue
+        iid, date = r[0].strip(), r[1].strip()
+        if not iid:
+            iid = f"I{nxt:03d}"; nxt += 1
+            updates.append({"range": f"A{rn}", "values": [[iid]]})
+        if not date:
+            date = f"{now:%d %b %Y}"
+            updates.append({"range": f"B{rn}", "values": [[date]]})
+        out.append(dict(id=iid, date=date, to=r[2].strip().lower(), text=text,
+                        deadline=r[4].strip(), priority=r[5].strip() or "Normal"))
+    if updates:
+        ws.batch_update(updates)
+    return out
+
+def ensure_instr_tab(f):
+    """Employee file me 'Instructions' tab: tick box + red/green colour."""
+    import gspread
+    try:
+        return f.worksheet(INSTR_TAB)
+    except gspread.WorksheetNotFound:
+        pass
+    ws = f.add_worksheet(INSTR_TAB, rows=300, cols=7, index=0)
+    ws.update(values=[["ID", "Date", "Instruction", "Deadline", "Priority", "Maine dekh liya (tick)", "Seen at"]],
+              range_name="A1")
+    area = [_rng(ws.id, 1, 300, 0, 7)]
+    cf = lambda formula, color: {"addConditionalFormatRule": {"index": 0, "rule": {"ranges": area, "booleanRule": {
+        "condition": {"type": "CUSTOM_FORMULA", "values": [{"userEnteredValue": formula}]},
+        "format": {"backgroundColor": color}}}}}
+    reqs = [
+        _hdr_req(ws.id, 7), _wrap_req(ws.id, 2),
+        {"updateSheetProperties": {"properties": {"sheetId": ws.id, "gridProperties": {"frozenRowCount": 1}},
+                                   "fields": "gridProperties.frozenRowCount"}},
+        {"setDataValidation": {"range": _rng(ws.id, 1, 300, 5, 6), "rule": {
+            "condition": {"type": "BOOLEAN"}, "strict": True}}},
+        cf('=AND($A2<>"",$F2<>TRUE)', {"red": .96, "green": .80, "blue": .80}),     # tick nahi = red
+        cf('=AND($A2<>"",$F2=TRUE)', {"red": .85, "green": .92, "blue": .83}),      # tick = green
+    ] + _col_widths(ws.id, [60, 100, 440, 110, 90, 170, 150])
+    f.batch_update({"requests": reqs})
+    return ws
+
+def sync_instructions(f, name, email, instr, prior, now):
+    """Nayi instructions employee ki file me daalta hai, tick/seen padhta hai.
+    Returns (naye delivered ids, {id: seen_at})."""
+    ws = ensure_instr_tab(f)
+    vals = with_retry(ws.get_all_values)
+    have = {}
+    for rn, r in enumerate(vals, start=1):
+        if rn == 1 or not r or not r[0].strip():
+            continue
+        have[r[0].strip()] = (rn, r)
+    mine = [i for i in instr if i["to"] in ("", "all") or i["to"] == name.lower()]
+    new = [i for i in mine if i["id"] not in have]
+    if new:
+        start = max(len(vals) + 1, 2)
+        need = start + len(new) + 5
+        if ws.row_count < need:
+            ws.add_rows(need - ws.row_count + 50)
+        ws.update(values=[[i["id"], i["date"], i["text"], i["deadline"], i["priority"], False, ""] for i in new],
+                  range_name=f"A{start}")
+    stamp = f"{now:%d %b %Y %H:%M}"
+    seen, stamps = {}, []
+    for iid, (rn, r) in have.items():
+        r = (r + [""] * 7)[:7]
+        g = r[6].strip()
+        if r[5].strip().upper() == "TRUE" and not g:      # tick hua, time abhi tak nahi likha
+            g = stamp
+            stamps.append({"range": f"G{rn}", "values": [[stamp]]})
+        seen[iid] = g
+    if stamps:
+        ws.batch_update(stamps)
+    fresh = [i for i in new if (i["id"], name.lower()) not in prior]
+    if fresh and email:
+        lines = [f"- [{i['priority']}] {i['text']}" + (f"  (Deadline: {i['deadline']})" if i["deadline"] else "")
+                 for i in fresh]
+        subj = "Boss ki nayi instruction" + (" - HIGH" if any(i["priority"].lower() == "high" for i in fresh) else "")
+        body = (f"Hi {name},\n\nBoss ki taraf se nayi instruction:\n\n" + "\n".join(lines) +
+                f"\n\nSheet: {f.url}\n'{INSTR_TAB}' tab me 'Maine dekh liya' tick karo.")
+        send_mail(email, subj, body)
+    return [i["id"] for i in fresh], seen
+
+def read_status(sh):
+    """Pichli baar ka Instruction Status: delivered/seen time yaad rakhne ke liye."""
+    import gspread
+    try:
+        ws = sh.worksheet(STATUS_TAB)
+    except gspread.WorksheetNotFound:
+        return {}
+    out = {}
+    for r in ws.get_all_values():
+        r = (r + [""] * 8)[:8]
+        if re.match(r"I\d+$", r[0].strip()):
+            seen = r[6].strip()
+            out[(r[0].strip(), r[3].strip().lower())] = (
+                "" if r[5].strip() in ("", "-") else r[5].strip(), "" if seen in ("", "-") else seen)
+    return out
+
+def build_status_page(instr, emps, prior, seen_map, delivered_now, now):
+    p = Page(8, widths={1: 70, 2: 110, 3: 420, 4: 140, 5: 90, 6: 170, 7: 170, 8: 120}, wrap=[3])
+    p.add(["INSTRUCTION STATUS - kisne dekha, kisne nahi"])
+    p.add()
+    p.add(["ID", "Date", "Instruction", "Employee", "Priority", "Delivered", "Seen at", "Status"], "hdr")
+    for i in instr:
+        for e in emps:
+            if i["to"] not in ("", "all") and i["to"] != e.lower():
+                continue
+            pd, ps = prior.get((i["id"], e.lower()), ("", ""))
+            deliv = pd or (f"{now:%d %b %Y %H:%M}" if i["id"] in delivered_now.get(e, set()) else "")
+            seen = ps or seen_map.get(e, {}).get(i["id"], "")
+            p.add([i["id"], i["date"], i["text"], e, i["priority"], deliv or "-", seen or "-",
+                   "\u2705 Seen" if seen else "\u274C Not seen"])
+    return p
+
 # ------------------------- MAIN -------------------------
 def main():
     gc = client()
     sh = gc.open_by_key(os.environ["REPORT_SHEET_ID"])
-    today = dt.datetime.now(TZ).date()
+    now = dt.datetime.now(TZ)
+    today = now.date()
     rd = dt.date.fromisoformat(os.environ["REPORT_DATE"]) if os.getenv("REPORT_DATE") else today
     print(f"Report date: {rd}  (today IST: {today})")
 
     rules_ws, lookup = load_rules(sh)
     emp_ws, emp_rows = employee_files(sh)
     entries, emps, last_log = [], [], {}
+    instr, prior, seen_map, delivered_now = [], {}, {}, {}
 
     def collect(name, rows):
         es = parse_rows(rows, today)
@@ -566,7 +756,13 @@ def main():
     if emp_rows:        # naya model: har employee ki alag file
         cats = category_names(lookup) + ["Other"]
         status = {}
-        for rowno, name, fid in emp_rows:
+        try:
+            boss_ws = ensure_boss_tab(sh, [n for _, n, _, _ in emp_rows])
+            instr = load_boss_instructions(boss_ws, now)
+            prior = read_status(sh)
+        except Exception as ex:
+            print("Boss instructions setup failed:", ex)
+        for rowno, name, fid, email in emp_rows:
             emps.append(name)
             try:
                 f = with_retry(gc.open_by_key, fid)
@@ -575,7 +771,14 @@ def main():
                 rows = with_retry(ws.get_all_values)
                 made = ensure_today_block(f, ws, rows, today)
                 collect(name, rows)
-                status[rowno] = f"OK {dt.datetime.now(TZ):%d %b %H:%M}" + (" - aaj ka layout bana" if made else "")
+                note = ""
+                try:
+                    new_ids, seen = sync_instructions(f, name, email, instr, prior, now)
+                    seen_map[name], delivered_now[name] = seen, set(new_ids)
+                except Exception as ex:
+                    print(f"[{name}] instructions ERROR: {ex}")
+                    note = f" | instructions ERROR: {str(ex)[:80]}"
+                status[rowno] = (f"OK {now:%d %b %H:%M}" + (" - aaj ka layout bana" if made else "") + note)
             except Exception as ex:
                 print(f"[{name}] ERROR: {ex}")
                 status[rowno] = f"ERROR: {str(ex)[:150]}"
@@ -584,6 +787,11 @@ def main():
             emp_ws.batch_update([{"range": f"C{r}", "values": [[t]]} for r, t in status.items()])
         except Exception as ex:
             print("Status write failed:", ex)
+        if instr:
+            try:
+                write_tab(sh, STATUS_TAB, build_status_page(instr, emps, prior, seen_map, delivered_now, now))
+            except Exception as ex:
+                print("Instruction status failed:", ex)
     else:               # purana model: ek file, har tab = ek employee
         log = gc.open_by_key(os.environ["LOG_SHEET_ID"])
         for ws in log.worksheets():
@@ -606,7 +814,10 @@ def main():
     wk, mo = weekly_monthly(emps, days, recs)
     write_tab(sh, "Weekly", wk); write_tab(sh, "Monthly", mo)
 
-    order = ["Dashboard", "Daily"] + emps + ["Weekly", "Monthly", "Points Rules", "Employees"]
+    titles = [w.title for w in sh.worksheets()]
+    want = (["Dashboard", "Live", "Daily"] + emps +
+            ["Weekly", "Monthly", BOSS_TAB, STATUS_TAB, "Points Rules", "Employees"])
+    order = [n for n in want if n in titles] + [n for n in titles if n not in want]
     sh.reorder_worksheets([sh.worksheet(n) for n in order])
     try:
         d = sh.worksheet("Sheet1")
@@ -618,10 +829,7 @@ def main():
     # Email sirf tab jab SEND_EMAIL=true ho (raat ka run / manual run)
     if (os.getenv("SEND_EMAIL", "").lower() == "true"
             and os.getenv("SMTP_USER") and os.getenv("BOSS_EMAIL")):
-        msg = MIMEText(text + f"\n\nFull report: {sh.url}")
-        msg["Subject"], msg["From"], msg["To"] = f"Daily Report {rd:%d %b %Y}", os.environ["SMTP_USER"], os.environ["BOSS_EMAIL"]
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-            s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"]); s.send_message(msg)
+        send_mail(os.environ["BOSS_EMAIL"], f"Daily Report {rd:%d %b %Y}", text + f"\n\nFull report: {sh.url}")
 
 if __name__ == "__main__":
     main()
