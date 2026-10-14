@@ -20,6 +20,11 @@ FALLBACK_MINUTES = 10                                 # AI key na ho to unlisted
 COUNTS_BASE = {"approved", "corrected", "major"}     # in status par base points count hote hain
 ADJUSTMENT = {"approved": 1, "corrected": 0, "major": -1, "rejected": -3, "pending": 0}
 
+# --- Employee files / daily layout ---
+BLOCK_ROWS = int(os.getenv("BLOCK_ROWS", "12"))      # roz ke block me kitni khali rows
+SKIP_WEEKDAYS = {int(x) for x in os.getenv("SKIP_WEEKDAYS", "6").split(",") if x.strip()}  # 6 = Sunday
+STATUSES = ["Pending review", "Approved 1st time", "Minor correction", "Major correction", "Not approved"]
+
 # (Category, points per piece, aliases)  <- POINT SYSTEM sheet se
 SEED_RULES = [
     ("Thumbnail", 5, ""), ("Redesign", 4, ""), ("Islamic Post", 4, ""),
@@ -103,7 +108,10 @@ def parse_rows(rows, today):
             num = float(g("number") or 0)
         except ValueError:
             num = 0.0
-        out.append(dict(date=cur, category=g("category"), task=g("task"),
+        cat = g("category")
+        if cat.lower() in ("other", "others") and g("task"):
+            cat = g("task")          # dropdown me 'Other' chuna to task ka naam hi category banega
+        out.append(dict(date=cur, category=cat, task=g("task"),
                         status_raw=g("status"), number=num))
     return out
 
@@ -404,28 +412,185 @@ def load_rules(sh):
         ws.format("A1:E1", HDR)
     return ws, build_lookup(ws.get_all_values())
 
+# ------------------------- EMPLOYEE FILES / DAILY LAYOUT -------------------------
+WHITE = {"red": 1, "green": 1, "blue": 1}
+
+def with_retry(fn, *a, **kw):
+    import gspread
+    for _ in range(3):
+        try:
+            return fn(*a, **kw)
+        except gspread.exceptions.APIError as ex:
+            if "429" in str(ex) or "quota" in str(ex).lower():
+                print("Rate limit - 25s wait"); time.sleep(25); continue
+            raise
+    return fn(*a, **kw)
+
+def employee_files(sh):
+    """Report sheet ke 'Employees' tab se: Employee | Log File ID. Tab na ho to bana deta hai."""
+    import gspread
+    try:
+        ws = sh.worksheet("Employees")
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet("Employees", rows=60, cols=4)
+        ws.update(values=[["Employee", "Log File ID (ya poora link)", "Status (auto)"]], range_name="A1")
+        ws.format("A1:C1", HDR)
+        return ws, []
+    out = []
+    for i, r in enumerate(ws.get_all_values()[1:], start=2):
+        name = r[0].strip() if r else ""
+        fid = r[1].strip() if len(r) > 1 else ""
+        if not name or not fid:
+            continue
+        m = re.search(r"/d/([A-Za-z0-9_-]+)", fid)
+        out.append((i, name, m.group(1) if m else fid))
+    return ws, out
+
+def category_names(lookup):
+    names = []
+    for name, _, _ in lookup.values():
+        if name not in names:
+            names.append(name)
+    return names
+
+def get_daily_ws(f):
+    import gspread
+    try:
+        return f.worksheet("Daily Log")
+    except gspread.WorksheetNotFound:
+        sheets = f.worksheets()
+        if len(sheets) == 1 and not any(any(r) for r in sheets[0].get_all_values()):
+            sheets[0].update_title("Daily Log")
+            return sheets[0]
+        return f.add_worksheet("Daily Log", rows=300, cols=8)
+
+def ensure_lists(f, cats):
+    """Employee file me hidden 'Lists' tab: dropdown ki categories + status. Points Rules badle to khud update."""
+    import gspread
+    n = max(len(cats), len(STATUSES))
+    want = [["Category", "Status"]] + [[cats[i] if i < len(cats) else "",
+                                         STATUSES[i] if i < len(STATUSES) else ""] for i in range(n)]
+    created = False
+    try:
+        ws = f.worksheet("Lists")
+    except gspread.WorksheetNotFound:
+        ws = f.add_worksheet("Lists", rows=max(n + 20, 100), cols=3); created = True
+    have = [(r + ["", ""])[:2] for r in ws.get_all_values()]
+    if have != want:
+        ws.clear()
+        ws.update(values=want, range_name="A1")
+    if created:
+        f.batch_update({"requests": [{"updateSheetProperties": {
+            "properties": {"sheetId": ws.id, "hidden": True}, "fields": "hidden"}}]})
+
+def block_values(n, d):
+    ds = f"{d:%m/%d}" if DATE_ORDER == "mdy" else f"{d:%d/%m}"
+    rows = [[f"Day:{n} {ds}"], ["Sr", "Category", "Task", "Status", "Number"]]
+    rows += [[i, "", "", STATUSES[0], ""] for i in range(1, BLOCK_ROWS + 1)]
+    rows.append([])
+    return rows
+
+def block_requests(sheet_id, start, ncols=5):
+    """start = 'Day:' header ki 1-based row. Formatting + dropdowns (strict) + borders."""
+    h, ch = start - 1, start                 # 0-based: Day row, column-header row
+    d0, d1 = start + 1, start + 1 + BLOCK_ROWS
+    rng = lambda r0, r1, c0, c1: {"sheetId": sheet_id, "startRowIndex": r0, "endRowIndex": r1,
+                                  "startColumnIndex": c0, "endColumnIndex": c1}
+    line = {"style": "SOLID", "width": 1, "color": {"red": .75, "green": .75, "blue": .75}}
+    val = lambda col, cond, msg: {"setDataValidation": {"range": rng(d0, d1, col, col + 1), "rule": {
+        "condition": cond, "strict": True, "showCustomUi": True, "inputMessage": msg}}}
+    reqs = [
+        {"repeatCell": {"range": rng(h, h + 1, 0, ncols), "cell": {"userEnteredFormat": {
+            "textFormat": {"bold": True, "fontSize": 12, "foregroundColor": NAVY}}},
+            "fields": "userEnteredFormat.textFormat"}},
+        {"repeatCell": {"range": rng(ch, ch + 1, 0, ncols), "cell": {"userEnteredFormat": {
+            "backgroundColor": NAVY, "horizontalAlignment": "CENTER",
+            "textFormat": {"bold": True, "foregroundColor": WHITE}}},
+            "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,textFormat)"}},
+        {"updateBorders": {"range": rng(ch, d1, 0, ncols), "top": line, "bottom": line, "left": line,
+                           "right": line, "innerHorizontal": line, "innerVertical": line}},
+        val(1, {"type": "ONE_OF_RANGE", "values": [{"userEnteredValue": "=Lists!$A$2:$A$500"}]},
+            "List me se kaam ka type chuno (spelling type mat karo). List me na ho to 'Other' chuno aur Task me likho."),
+        val(3, {"type": "ONE_OF_LIST", "values": [{"userEnteredValue": s} for s in STATUSES]},
+            "Status boss/reviewer set karta hai."),
+        val(4, {"type": "NUMBER_GREATER_THAN_EQ", "values": [{"userEnteredValue": "0"}]},
+            "Number = kitne pieces bane (count)."),
+    ]
+    for col, w in enumerate([50, 270, 330, 170, 90]):
+        reqs.append({"updateDimensionProperties": {
+            "range": {"sheetId": sheet_id, "dimension": "COLUMNS", "startIndex": col, "endIndex": col + 1},
+            "properties": {"pixelSize": w}, "fields": "pixelSize"}})
+    return reqs
+
+def ensure_today_block(f, ws, rows, today):
+    """Aaj ka din ka ready layout (dropdowns ke saath) na ho to neeche bana deta hai. True = bana."""
+    heads = []
+    for r in rows:
+        line = " ".join(c for c in r if c).strip()
+        if line:
+            ok, d = header_date(r, line, today)
+            if ok: heads.append(d)
+    if today in heads or today.weekday() in SKIP_WEEKDAYS:
+        return False
+    block = block_values(len(heads) + 1, today)
+    start = len(rows) + 2 if rows else 1
+    need = start + len(block) + 5
+    if ws.row_count < need:
+        ws.add_rows(need - ws.row_count + 50)
+    ws.update(values=block, range_name=f"A{start}")
+    f.batch_update({"requests": block_requests(ws.id, start)})
+    return True
+
 # ------------------------- MAIN -------------------------
 def main():
     gc = client()
-    log, sh = gc.open_by_key(os.environ["LOG_SHEET_ID"]), gc.open_by_key(os.environ["REPORT_SHEET_ID"])
+    sh = gc.open_by_key(os.environ["REPORT_SHEET_ID"])
     today = dt.datetime.now(TZ).date()
     rd = dt.date.fromisoformat(os.environ["REPORT_DATE"]) if os.getenv("REPORT_DATE") else today
     print(f"Report date: {rd}  (today IST: {today})")
 
+    rules_ws, lookup = load_rules(sh)
+    emp_ws, emp_rows = employee_files(sh)
     entries, emps, last_log = [], [], {}
-    for ws in log.worksheets():
-        if ws.title.lower() in IGNORE_TABS: continue
-        emps.append(ws.title)
-        es = parse_rows(ws.get_all_values(), today)
+
+    def collect(name, rows):
+        es = parse_rows(rows, today)
         dates = sorted({e["date"] for e in es})
-        print(f"[{ws.title}] {len(es)} entries; dates found: "
+        print(f"[{name}] {len(es)} entries; dates found: "
               f"{', '.join(f'{d:%d %b}' for d in dates) or 'NONE'}")
         ok = [d for d in dates if d <= rd]
-        if ok: last_log[ws.title] = max(ok)
+        if ok: last_log[name] = max(ok)
         for e in es:
-            if e["date"] <= rd: entries.append({**e, "emp": ws.title})
+            if e["date"] <= rd: entries.append({**e, "emp": name})
 
-    rules_ws, lookup = load_rules(sh)
+    if emp_rows:        # naya model: har employee ki alag file
+        cats = category_names(lookup) + ["Other"]
+        status = {}
+        for rowno, name, fid in emp_rows:
+            emps.append(name)
+            try:
+                f = with_retry(gc.open_by_key, fid)
+                ws = get_daily_ws(f)
+                ensure_lists(f, cats)
+                rows = with_retry(ws.get_all_values)
+                made = ensure_today_block(f, ws, rows, today)
+                collect(name, rows)
+                status[rowno] = f"OK {dt.datetime.now(TZ):%d %b %H:%M}" + (" - aaj ka layout bana" if made else "")
+            except Exception as ex:
+                print(f"[{name}] ERROR: {ex}")
+                status[rowno] = f"ERROR: {str(ex)[:150]}"
+            time.sleep(1.5)
+        try:
+            emp_ws.batch_update([{"range": f"C{r}", "values": [[t]]} for r, t in status.items()])
+        except Exception as ex:
+            print("Status write failed:", ex)
+    else:               # purana model: ek file, har tab = ek employee
+        log = gc.open_by_key(os.environ["LOG_SHEET_ID"])
+        for ws in log.worksheets():
+            if ws.title.lower() in IGNORE_TABS: continue
+            emps.append(ws.title)
+            collect(ws.title, ws.get_all_values())
+
     def new_rule(cat, task):
         mins, why = estimate_minutes(cat, task)
         pts = round(mins / 4, 2)
@@ -441,7 +606,7 @@ def main():
     wk, mo = weekly_monthly(emps, days, recs)
     write_tab(sh, "Weekly", wk); write_tab(sh, "Monthly", mo)
 
-    order = ["Dashboard", "Daily"] + emps + ["Weekly", "Monthly", "Points Rules"]
+    order = ["Dashboard", "Daily"] + emps + ["Weekly", "Monthly", "Points Rules", "Employees"]
     sh.reorder_worksheets([sh.worksheet(n) for n in order])
     try:
         d = sh.worksheet("Sheet1")
